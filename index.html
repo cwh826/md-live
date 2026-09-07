@@ -55,7 +55,8 @@
   html, body { height: 100%; }
   body { display: flex; flex-direction: column; height: 100dvh; overflow: hidden; }
   main { display: flex; flex: 1 1 auto; min-height: 0; }
-  .pane { flex: 1 1 50%; min-width: 0; min-height: 0; overflow: auto; }
+  /* flex-basis 置 0：两侧宽度完全由 flex-grow 决定，便于拖动条按比例分配（默认 1:1） */
+  .pane { flex: 1 1 0%; min-width: 0; min-height: 0; overflow: auto; }
 
   /* 视图切换：双栏 / 仅编辑 / 仅预览 */
   main[data-view="edit"] .pane--preview { display: none; }
@@ -201,12 +202,41 @@
   .file-badge[hidden] { display: none; }
   .file-badge .fb-name { overflow: hidden; text-overflow: ellipsis; }
 
+  /* ============ [05.9] 可拖动分栏条 ============ */
+  /* 竖排（PC 左右分栏）时它是 7px 宽的竖条，横排（手机上下分栏）时自动变横条 */
+  .splitter {
+    flex: 0 0 7px; position: relative; box-sizing: border-box;
+    background: transparent; cursor: col-resize; touch-action: none;   /* touch-action：触屏拖动不被页面滚动抢走 */
+  }
+  /* 视觉只有 1px 细线，命中区域靠 ::after 向两侧各扩 3px，方便鼠标抓取 */
+  .splitter::before {
+    content: ''; position: absolute; top: 0; bottom: 0; left: 3px; width: 1px;
+    background: var(--p-line); transition: background .15s, width .15s, left .15s;
+  }
+  .splitter::after { content: ''; position: absolute; inset: 0 -3px; }
+  .splitter:hover::before, .splitter.dragging::before { background: #2563EB; width: 3px; left: 2px; }
+  .dark .splitter:hover::before, .dark .splitter.dragging::before { background: #60A5FA; }
+  .splitter:focus-visible { outline: 2px solid #2563EB; outline-offset: -2px; }
+  /* 单栏视图没有可分的栏，直接隐藏 */
+  main[data-view="edit"] .splitter,
+  main[data-view="preview"] .splitter { display: none; }
+  /* 拖动过程中：禁止选中文本、光标全程保持调整样式 */
+  body.resizing { user-select: none; cursor: col-resize; }
+  body.resizing * { cursor: col-resize; }
+
   /* ============ [06] 响应式：手机端改为上下排布（上编辑 / 下预览） ============ */
   @media (max-width: 767px) {
     main { flex-direction: column; }
-    .pane { flex: 1 1 50%; height: 50%; }
+    .pane { flex: 1 1 0%; }
     #editor { padding: 14px 16px; font-size: 13.5px; }
     .md-body { padding: 14px 16px; font-size: 15.5px; }
+
+    /* 分隔条转为横向：细线由上/下边距控制，光标改 row-resize */
+    .splitter { cursor: row-resize; }
+    .splitter::before { top: 3px; bottom: auto; left: 0; right: 0; width: auto; height: 1px; }
+    .splitter::after { inset: -3px 0; }
+    .splitter:hover::before, .splitter.dragging::before { height: 3px; top: 2px; width: auto; left: 0; }
+    body.resizing, body.resizing * { cursor: row-resize; }
   }
   /* 窄屏状态栏只保留最关键信息 */
   @media (max-width: 767px) { .hide-sm { display: none; } }
@@ -320,9 +350,15 @@
 
 <!-- ===== 工作区：左编辑 / 右预览（手机端上下） ===== -->
 <main id="workspace" data-view="split">
-  <section class="pane pane--edit border-r border-line dark:border-dline">
+  <section class="pane pane--edit">
     <textarea id="editor" spellcheck="false" placeholder="在此输入 Markdown，右侧将实时预览…"></textarea>
   </section>
+
+  <!-- 分栏拖动条：只在双栏视图显示（单栏视图由 CSS 隐藏） -->
+  <div id="splitter" class="splitter" role="separator" tabindex="0"
+       aria-label="调整分栏比例" aria-valuemin="15" aria-valuemax="85" aria-valuenow="50"
+       title="拖动调整分栏比例（双击恢复 1:1，聚焦后可用方向键微调）"></div>
+
   <section class="pane pane--preview">
     <article id="preview" class="md-body"></article>
   </section>
@@ -489,7 +525,10 @@ SELECT id, title FROM docs WHERE status = 'published';
     tabs: document.getElementById('tabs'),
     tabList: document.getElementById('tab-list'),
     fileInput: document.getElementById('file-input'),
-    fileBadge: document.getElementById('file-badge')
+    fileBadge: document.getElementById('file-badge'),
+    paneEdit: document.querySelector('.pane--edit'),
+    panePreview: document.querySelector('.pane--preview'),
+    splitter: document.getElementById('splitter')
   };
 
   /* ==================== B2. 本地文档与配套图片资源 ==================== */
@@ -941,6 +980,110 @@ SELECT id, title FROM docs WHERE status = 'published';
     el.kbdMask.classList.toggle('open', on);
     if (!on) el.editor.focus();
   }
+
+  /* ==================== H4. 分栏比例：拖动 / 键盘微调 / 双击复位 ==================== */
+  var SPLIT_KEY   = 'md-live-split';   // 比例记忆（与主题同策略：只存偏好，不存内容）
+  var SPLIT_MIN   = 0.15;              // 编辑区最小占比
+  var SPLIT_MAX   = 0.85;              // 编辑区最大占比
+  var SPLIT_MIN_PX = 120;              // 单侧最小像素，窗口很窄时优先按像素约束
+  var splitRatio  = 0.5;
+  var splitDragging = false;
+
+  // 手机端（≤767px）main 是 column，同一套 grow 逻辑即变成上下高度比
+  function isColumn() { return window.matchMedia('(max-width: 767px)').matches; }
+
+  function splitterSize() {
+    var r = el.splitter.getBoundingClientRect();
+    return isColumn() ? r.height : r.width;
+  }
+
+  // 比例下限要同时满足「占比」与「最小像素」两个约束
+  function clampSplit(r) {
+    if (!isFinite(r)) return splitRatio;
+    var box = el.main.getBoundingClientRect();
+    var track = (isColumn() ? box.height : box.width) - splitterSize();
+    if (track <= 0) return splitRatio;
+    var minPx = Math.min(SPLIT_MIN_PX, Math.max(20, track / 2 - 1));   // 窗口极窄时退让，避免出现 lo > hi
+    var lo = Math.min(0.49, Math.max(SPLIT_MIN, minPx / track));
+    var hi = Math.max(0.51, Math.min(SPLIT_MAX, 1 - minPx / track));
+    return Math.min(hi, Math.max(lo, r));
+  }
+
+  // 两侧用 flex-grow 表达比例：编辑区 ratio，预览区 1-ratio（flex-basis 已在 CSS 里置 0）
+  function applySplit(ratio) {
+    splitRatio = clampSplit(ratio);
+    el.paneEdit.style.flexGrow = splitRatio;
+    el.panePreview.style.flexGrow = 1 - splitRatio;
+    var pct = Math.round(splitRatio * 100);
+    el.splitter.setAttribute('aria-valuenow', pct);
+    el.splitter.title = '编辑区 ' + pct + '% / 预览区 ' + (100 - pct) + '%（双击恢复 1:1，聚焦后可用方向键微调）';
+  }
+
+  function ratioFromEvent(e) {
+    var r = el.main.getBoundingClientRect();
+    var bar = splitterSize();
+    var track = (isColumn() ? r.height : r.width) - bar;
+    if (track <= 0) return splitRatio;
+    var pos = isColumn() ? (e.clientY - r.top) : (e.clientX - r.left);
+    return (pos - bar / 2) / track;
+  }
+
+  function readSplit() {
+    try {
+      var v = parseFloat(localStorage.getItem(SPLIT_KEY));
+      return isFinite(v) ? v : 0.5;
+    } catch (e) { return 0.5; }
+  }
+
+  function saveSplit() {
+    try { localStorage.setItem(SPLIT_KEY, String(splitRatio)); } catch (e) { /* 隐私模式下忽略 */ }
+  }
+
+  el.splitter.addEventListener('pointerdown', function (e) {
+    if (e.pointerType === 'mouse' && e.button !== 0) return;
+    splitDragging = true;
+    el.splitter.classList.add('dragging');
+    document.body.classList.add('resizing');
+    try { el.splitter.setPointerCapture(e.pointerId); } catch (err) { /* 老浏览器无指针捕获也能拖，只是移出元素会丢事件 */ }
+    e.preventDefault();
+  });
+
+  el.splitter.addEventListener('pointermove', function (e) {
+    if (splitDragging) applySplit(ratioFromEvent(e));
+  });
+
+  function endSplitDrag(e) {
+    if (!splitDragging) return;
+    splitDragging = false;
+    el.splitter.classList.remove('dragging');
+    document.body.classList.remove('resizing');
+    try { el.splitter.releasePointerCapture(e.pointerId); } catch (err) {}
+    saveSplit();
+  }
+  el.splitter.addEventListener('pointerup', endSplitDrag);
+  el.splitter.addEventListener('pointercancel', endSplitDrag);
+  el.splitter.addEventListener('lostpointercapture', endSplitDrag);
+
+  el.splitter.addEventListener('dblclick', function () { applySplit(0.5); saveSplit(); });
+
+  // 键盘微调：分隔条可聚焦，方向键 ±2%（按住 Shift ±10%），Home / Enter 复位
+  el.splitter.addEventListener('keydown', function (e) {
+    var dir = 0;
+    if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') dir = -1;
+    else if (e.key === 'ArrowRight' || e.key === 'ArrowDown') dir = 1;
+    else if (e.key === 'Home' || e.key === 'Enter') { applySplit(0.5); saveSplit(); e.preventDefault(); return; }
+    else return;
+    e.preventDefault();
+    applySplit(splitRatio + dir * (e.shiftKey ? 0.1 : 0.02));
+    saveSplit();
+  });
+
+  // 窗口尺寸变化 / 跨过 767px 断点后重新夹一次（此时像素下限可能反超当前比例）
+  var splitResizeTimer = null;
+  window.addEventListener('resize', function () {
+    if (splitResizeTimer) return;
+    splitResizeTimer = setTimeout(function () { splitResizeTimer = null; applySplit(splitRatio); }, 80);
+  });
 
   /* ==================== I. 事件绑定 ==================== */
   el.editor.addEventListener('input', syncSource);
@@ -1638,6 +1781,7 @@ SELECT id, title FROM docs WHERE status = 'published';
     if (!window.tailwind) document.documentElement.classList.add('no-tw');  // Tailwind 不可用时的兜底布局
     theme.init();
     setView('split');
+    applySplit(readSplit());              // 恢复上次的分栏比例（默认 1:1）
     var first = newDoc('未命名', el.editor.value, {});   // 未命名的工作草稿
     activeId = first.id;
     renderTabs();
