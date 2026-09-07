@@ -609,13 +609,14 @@ SELECT id, title FROM docs WHERE status = 'published';
     return window.DOMPurify.sanitize(html);
   }
 
-  // 外链统一新窗口打开且阻断 tabnabbing
+  // 外链统一新窗口打开且阻断 tabnabbing（站内锚点 #xxx 除外，否则会莫名跳新标签）
   if (window.DOMPurify) {
     window.DOMPurify.addHook('afterSanitizeAttributes', function (node) {
-      if (node.tagName === 'A' && node.getAttribute('href')) {
-        node.setAttribute('target', '_blank');
-        node.setAttribute('rel', 'noopener noreferrer');
-      }
+      if (node.tagName !== 'A') return;
+      var href = node.getAttribute('href');
+      if (!href || href.charAt(0) === '#') return;
+      node.setAttribute('target', '_blank');
+      node.setAttribute('rel', 'noopener noreferrer');
     });
   }
 
@@ -692,25 +693,39 @@ SELECT id, title FROM docs WHERE status = 'published';
     return Math.max(1, Math.round(cjk / 400 + en / 250));
   }
 
+  // 计数缓存：字符数 / 行数 / 阅读时长都与全文长度成正比，
+  // 只在原文真正变化时重算（此前每次 keyup、click、select 都会全量扫描，
+  // 大文档下按一下方向键就要跑 3 次全文正则 + 一次 split）
+  var counts = { src: null, chars: 0, lines: 1, mins: 0 };
+  function computeCounts(raw) {
+    if (counts.src === raw) return counts;          // 同一份字符串直接复用
+    counts = {
+      src: raw,
+      chars: raw.replace(/[\r\n]/g, '').length,
+      lines: raw.split('\n').length,
+      mins: readingMinutes(raw)
+    };
+    return counts;
+  }
+
   // 光标所在行列（列按字符数计）
+  // 用 charCodeAt 扫描代替 slice + split：不再为每次按键分配一整段前缀字符串和数组
   function cursorPos() {
-    var p = el.editor.selectionStart || 0;
-    var before = el.editor.value.slice(0, p);
-    return { line: before.split('\n').length, col: p - (before.lastIndexOf('\n') + 1) + 1 };
+    var v = el.editor.value, p = el.editor.selectionStart || 0;
+    var line = 1, nl = -1;
+    for (var i = 0; i < p; i++) if (v.charCodeAt(i) === 10) { line++; nl = i; }
+    return { line: line, col: p - nl };
   }
 
   function updateStats(ms) {
-    var raw = state.source;
-    var chars = raw.replace(/[\r\n]/g, '').length;
-    var lines = raw.split('\n').length;
-    var mins = readingMinutes(raw);
+    var c = computeCounts(state.source);
     var pos = cursorPos();
     var time = (typeof ms === 'number' && ms > 0) ? ' · 渲染 ' + Math.round(ms) + 'ms' : '';
-    el.stats.innerHTML = '字符数 ' + chars.toLocaleString() +
-      ' · 行数 ' + lines.toLocaleString() +
-      '<span class="hide-sm"> · 阅读 ~' + mins + ' 分钟</span>' +
+    el.stats.innerHTML = '字符数 ' + c.chars.toLocaleString() +
+      ' · 行数 ' + c.lines.toLocaleString() +
+      '<span class="hide-sm"> · 阅读 ~' + c.mins + ' 分钟</span>' +
       '<span class="hide-sm"> · 行 ' + pos.line + '，列 ' + pos.col + '</span>' + time;
-    el.stats.style.color = chars > WARN_CHARS ? '#D97706' : '';   // 超阈值仅做视觉预警
+    el.stats.style.color = c.chars > WARN_CHARS ? '#D97706' : '';   // 超阈值仅做视觉预警
   }
 
   var noticeTimer = null;
@@ -774,10 +789,31 @@ SELECT id, title FROM docs WHERE status = 'published';
     timer = setTimeout(render, DEBOUNCE_MS);
   }
 
+  /**
+   * 通过浏览器自身的编辑事务写入，保留原生撤销栈（Ctrl+Z）。
+   * 直接给 textarea.value 赋值会清空 undo 历史——点一次「加粗」后就再也撤销不回去了。
+   * execCommand 不可用、或文本过大（避免几 MB 的 Base64 图片塞进 undo 栈）时回退为直接赋值：
+   * 功能完全一致，只是这一次改动不可撤销。
+   */
+  var EXEC_MAX_CHARS = 50000;
+  function editThroughCommand(start, end, text) {
+    var before = el.editor.value;
+    var expect = before.slice(0, start) + text + before.slice(end);
+    if (text.length <= EXEC_MAX_CHARS) {
+      try {
+        el.editor.focus();
+        el.editor.setSelectionRange(start, end);
+        var ok = (text === '') ? document.execCommand('delete')
+                               : document.execCommand('insertText', false, text);
+        if (ok && el.editor.value === expect) return;     // 写入成功且结果符合预期
+      } catch (e) { /* 落到下方直接赋值 */ }
+    }
+    el.editor.value = expect;
+  }
+
   // 替换指定区间文本，并把光标/选区置于 selStart~selEnd（默认落在插入内容之后）
   function replaceRange(start, end, text, selStart, selEnd) {
-    var v = el.editor.value;
-    el.editor.value = v.slice(0, start) + text + v.slice(end);
+    editThroughCommand(start, end, text);
     el.editor.focus();
     var a = (typeof selStart === 'number') ? selStart : start + text.length;
     var b = (typeof selEnd === 'number') ? selEnd : a;
@@ -1505,6 +1541,24 @@ SELECT id, title FROM docs WHERE status = 'published';
   el.fileInput.addEventListener('change', function () {
     handleFiles(this.files, {});
     this.value = '';                                 // 允许重复选择同一个文件
+  });
+
+  /* ---- 离开保护：内容只存在于内存，刷新 / 关闭标签页会直接丢失 ---- */
+  // 当前文档以编辑区实时值为准（dirty 标记只在输入时更新，这里直接比对更可靠）
+  function hasUnsavedWork() {
+    for (var i = 0; i < docs.length; i++) {
+      var d = docs[i];
+      var cur = (d.id === activeId) ? el.editor.value : d.text;
+      if (cur !== d.original) return true;
+    }
+    return false;
+  }
+
+  window.addEventListener('beforeunload', function (e) {
+    if (!hasUnsavedWork()) return;                   // 没动过内容就不打扰
+    e.preventDefault();
+    e.returnValue = '';                              // 部分浏览器要求给 returnValue 赋值才会弹确认框
+    return '';
   });
 
   el.tabList.addEventListener('click', function (e) {
